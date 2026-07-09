@@ -1,17 +1,18 @@
 """
-Pulls today's Dawn content via official RSS feeds (stable, unlike scraping
-the homepage HTML which breaks whenever Dawn changes their site design).
+Pulls today's Dawn content via official RSS feeds.
 
-Fixes applied here vs the earlier version:
-- Retries the HTTP request instead of giving up on the first failure.
-- Extracts ALL <p> tags on the page (Dawn doesn't reliably wrap article body
-  in one predictable class name), then trims trailing boilerplate
-  ("Published in Dawn...", "Our readers are at the heart...", nav/footer
-  junk) instead of relying on a single CSS selector that can silently match
-  nothing.
-- Falls back to the RSS <summary> AND the page's og:description meta tag
-  before giving up, so "article unavailable" should no longer happen except
-  in a genuine network outage.
+Fixes applied in this version:
+- feedparser.parse(url) fetches with no User-Agent header by default, which
+  some sites silently reject (returns empty/blocked response -> "no entries
+  found"). We now fetch the feed bytes ourselves with a browser-like UA via
+  requests, then hand the bytes to feedparser -- much more reliable.
+- "/feeds/editorial" is not a confirmed-working Dawn feed URL. This version
+  tries a small ordered list of candidate feeds and uses the first one that
+  actually returns entries, instead of hardcoding one unconfirmed URL and
+  crashing if it's wrong.
+- Article body extraction grabs all <p> tags (Dawn doesn't reliably wrap
+  content in one predictable class), trims known trailing boilerplate, and
+  falls back to the og:description meta tag if paragraph scraping is thin.
 """
 import re
 import time
@@ -24,11 +25,24 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Paragraphs at/after any of these (case-insensitive, prefix match) are Dawn's
-# standard trailing boilerplate, not article content -- cut everything from
-# the first match onward.
+# Tried in order; first one that returns entries wins. dawn.com/feeds/home
+# is a confirmed-live feed; the others are attempted first since they're
+# more specifically "editorial", but we don't depend on any single one.
+EDITORIAL_FEED_CANDIDATES = [
+    "https://www.dawn.com/feeds/opinion",
+    "https://www.dawn.com/feeds/editorial",
+    "https://www.dawn.com/feeds/home",
+]
+
+HEADLINE_FEED_CANDIDATES = [
+    "https://www.dawn.com/feeds/home",
+    "https://www.dawn.com/feeds/pakistan",
+    "https://www.dawn.com/feeds/world",
+]
+
 STOP_MARKERS = [
     "published in dawn",
     "our readers are at the heart",
@@ -52,8 +66,29 @@ def _fetch_with_retry(url: str, retries: int = 3, timeout: int = 20):
     return None
 
 
+def _parse_feed(url: str):
+    """Fetch feed bytes ourselves (with a real User-Agent) then parse, since
+    feedparser's own fetch sends no UA and can get silently blocked."""
+    resp = _fetch_with_retry(url, retries=2, timeout=15)
+    if resp is None:
+        return None
+    parsed = feedparser.parse(resp.content)
+    if parsed.entries:
+        return parsed
+    return None
+
+
+def _first_working_feed(candidates: list):
+    for url in candidates:
+        print(f"[fetch] trying feed: {url}")
+        parsed = _parse_feed(url)
+        if parsed:
+            print(f"[fetch] success: {url} ({len(parsed.entries)} entries)")
+            return parsed, url
+    return None, None
+
+
 def _fetch_full_text(url: str) -> str:
-    """Best-effort full article text extraction from a Dawn article page."""
     resp = _fetch_with_retry(url)
     if resp is None:
         return ""
@@ -73,8 +108,6 @@ def _fetch_full_text(url: str) -> str:
     if len(text) > 100:
         return text
 
-    # Fallback: og:description meta tag (usually a 1-2 sentence dek, better
-    # than nothing if paragraph scraping failed).
     meta = soup.find("meta", property="og:description")
     if meta and meta.get("content"):
         return meta["content"].strip()
@@ -83,10 +116,15 @@ def _fetch_full_text(url: str) -> str:
 
 
 def get_latest_editorial() -> dict:
-    """Returns {'title', 'link', 'summary', 'full_text', 'source'} for the newest editorial."""
-    feed = feedparser.parse(config.DAWN_EDITORIAL_FEED)
-    if not feed.entries:
-        raise RuntimeError("No entries found in Dawn editorial feed -- feed may be down.")
+    """Returns {'title', 'link', 'summary', 'full_text', 'source'} for the newest editorial/opinion piece."""
+    feed, used_url = _first_working_feed(EDITORIAL_FEED_CANDIDATES)
+    if feed is None:
+        raise RuntimeError(
+            "All Dawn feed candidates failed (opinion, editorial, home). "
+            "This is likely a temporary Dawn outage or a network block on the "
+            "GitHub runner -- try again shortly. Candidates tried: "
+            + ", ".join(EDITORIAL_FEED_CANDIDATES)
+        )
 
     entry = feed.entries[0]
     title = entry.get("title", "Untitled")
@@ -94,32 +132,27 @@ def get_latest_editorial() -> dict:
     summary = re.sub("<[^<]+?>", "", entry.get("summary", "")).strip()
 
     full_text = _fetch_full_text(link) if link else ""
-    source = "full_article"
+    source = f"full_article ({used_url})"
     if not full_text or len(full_text) < 100:
         full_text = summary
-        source = "rss_summary_fallback"
+        source = f"rss_summary_fallback ({used_url})"
 
     if not full_text:
-        # Absolute last resort so the pipeline never sends "unavailable"
-        # silently -- at minimum we always have the headline.
         full_text = title
-        source = "title_only_fallback"
+        source = f"title_only_fallback ({used_url})"
 
-    return {
-        "title": title,
-        "link": link,
-        "summary": summary,
-        "full_text": full_text,
-        "source": source,
-    }
+    return {"title": title, "link": link, "summary": summary, "full_text": full_text, "source": source}
 
 
 def get_headline_pool(limit_per_feed: int = 15) -> list:
-    """Pulls recent Pakistan + World + Home headlines for MCQ/bulletin variety."""
-    feeds = [config.DAWN_PAKISTAN_FEED, config.DAWN_WORLD_FEED, config.DAWN_HOME_FEED]
+    """Pulls recent headlines for MCQ/bulletin variety. Skips any feed that
+    fails instead of crashing the whole run."""
     headlines = []
-    for feed_url in feeds:
-        parsed = feedparser.parse(feed_url)
+    for feed_url in HEADLINE_FEED_CANDIDATES:
+        parsed = _parse_feed(feed_url)
+        if not parsed:
+            print(f"[fetch] skipping headline feed (failed): {feed_url}")
+            continue
         for entry in parsed.entries[:limit_per_feed]:
             summary = re.sub("<[^<]+?>", "", entry.get("summary", "")).strip()
             headlines.append(
