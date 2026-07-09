@@ -3,7 +3,20 @@ name: CSS/FIA Rotating Agent (every 30 min)
 on:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Force a specific task (leave as 'auto' for normal time-based rotation)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - summary
+          - vocabulary
+          - quiz
+          - resources
+          - topic_image
 
 jobs:
   run-agent:
@@ -19,9 +32,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run agent (one task this slot)
+      - name: Run agent
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_TASK: ${{ inputs.task }}
         run: python main_agent.py
