@@ -15,6 +15,7 @@ The task for "now" is picked purely from the current UTC time (no external
 state needed), so this stays simple and never gets out of sync.
 """
 import datetime
+import os
 import traceback
 import fetch_article
 import ai_processor
@@ -90,9 +91,17 @@ def run_topic_image():
 
 
 def run():
-    slot = _current_slot()
-    task_name = config.TASKS[slot]
-    print(f"Running slot {slot}: {task_name}")
+    forced = os.environ.get("FORCE_TASK", "auto").strip().lower()
+    if forced and forced != "auto":
+        if forced not in config.TASKS:
+            raise RuntimeError(f"FORCE_TASK='{forced}' is not a known task: {config.TASKS}")
+        task_name = forced
+        slot = config.TASKS.index(forced)
+        print(f"Manual override: forcing task '{task_name}'")
+    else:
+        slot = _current_slot()
+        task_name = config.TASKS[slot]
+        print(f"Auto (time-based) slot {slot}: {task_name}")
 
     # Topic image doesn't need the Dawn article at all -- skip fetching it
     # to save an HTTP call when it's not needed.
